@@ -1,0 +1,10 @@
+metric: apls
+data_dim: 2
+parameters:
+  max_nodes: 500
+  max_snap_dist: 4.0
+  dist_close_node: 10.0
+  allow_renaming: true
+  select_intersections: false
+  min_path_length: 10.0
+  random_seed: 0

@@ -1,0 +1,6 @@
+seed: 20260925
+node_count: 50
+chord_count: 35
+position_extent: 100.0
+chord_span: 5
+coordinate_dim: 2

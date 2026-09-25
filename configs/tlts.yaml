@@ -1,0 +1,9 @@
+metric: tlts
+data_dim: 2
+parameters:
+  num_paths: 100
+  min_path_length: 10
+  radius_match: 5.0
+  length_deviation: 0.05
+  max_attempts: 1000
+  random_seed: 0
