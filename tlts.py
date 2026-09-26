@@ -81,13 +81,18 @@ def _validate_tlts_config(config: MetricConfig) -> MetricConfig:
             )
         return normalized
 
+    exhaustive = parameters["num_paths"] == "all"
+    if exhaustive and (
+        parameters["max_attempts"] is not None or parameters["random_seed"] is not None
+    ):
+        raise ValueError("num_paths=all requires max_attempts=null and random_seed=null")
     normalized_parameters = {
-        "num_paths": require_integer("num_paths", 0),
+        "num_paths": "all" if exhaustive else require_integer("num_paths", 0),
         "min_path_length": require_integer("min_path_length", 1),
         "radius_match": require_number("radius_match"),
         "length_deviation": require_number("length_deviation"),
-        "max_attempts": require_integer("max_attempts", 0),
-        "random_seed": require_integer("random_seed", 0),
+        "max_attempts": None if exhaustive else require_integer("max_attempts", 0),
+        "random_seed": None if exhaustive else require_integer("random_seed", 0),
     }
     return MetricConfig(
         metric="tlts",
@@ -204,6 +209,23 @@ def _extract_gt_paths(
                 "shortest_path_gt": shortest_path,
             }
         )
+    return paths
+
+
+def _all_gt_paths(graph: nx.Graph, min_path_length: int) -> list[dict[str, Any]]:
+    """One unweighted shortest path for every eligible unordered endpoint pair."""
+    paths: list[dict[str, Any]] = []
+    for component in nx.connected_components(graph):
+        nodes = [node for node in graph if node in component]
+        for index, source in enumerate(nodes):
+            for target in nodes[index + 1:]:
+                route = list(nx.shortest_path(graph, source, target))
+                if len(route) >= min_path_length:
+                    paths.append({
+                        "s_gt": _path_endpoint(graph, source),
+                        "t_gt": _path_endpoint(graph, target),
+                        "shortest_path_gt": route,
+                    })
     return paths
 
 
@@ -386,14 +408,17 @@ class TLTS:
         parameters = config.parameters
         self._validate_graph(gt_graph, "gt_graph", config.data_dim)
         self._validate_graph(pred_graph, "pred_graph", config.data_dim)
-        random_state = np.random.default_rng(parameters["random_seed"])
-        paths = _extract_gt_paths(
-            gt_graph,
-            N=parameters["num_paths"],
-            min_path_length=parameters["min_path_length"],
-            random_state=random_state,
-            max_attempts=parameters["max_attempts"],
-        )
+        if parameters["num_paths"] == "all":
+            paths = _all_gt_paths(gt_graph, parameters["min_path_length"])
+        else:
+            random_state = np.random.default_rng(parameters["random_seed"])
+            paths = _extract_gt_paths(
+                gt_graph,
+                N=parameters["num_paths"],
+                min_path_length=parameters["min_path_length"],
+                random_state=random_state,
+                max_attempts=parameters["max_attempts"],
+            )
         if not paths:
             return {
                 "tlts_correct": 0.0,

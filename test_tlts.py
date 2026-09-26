@@ -8,7 +8,7 @@ import networkx as nx
 import numpy as np
 import pytest
 
-from apls_tlts.tlts import TLTS, _extract_gt_paths, _toolong_tooshort_score
+from apls_tlts.tlts import TLTS, _all_gt_paths, _extract_gt_paths, _toolong_tooshort_score
 
 
 TLTS_CONFIG = {
@@ -23,12 +23,14 @@ TLTS_CONFIG = {
 
 def _write_config(
     directory: Path,
-    values: dict[str, int | float | str],
+    values: dict[str, int | float | str | None],
     data_dim: int,
 ) -> Path:
     path = directory / "tlts.yaml"
 
-    def yaml_scalar(value: int | float | str) -> str:
+    def yaml_scalar(value: int | float | str | None) -> str:
+        if value is None:
+            return "null"
         if isinstance(value, str):
             return "'" + value.replace("'", "''") + "'"
         return str(value)
@@ -45,6 +47,32 @@ def _line_graph(node_count: int) -> nx.Graph:
     graph.add_nodes_from((node, {"pos": np.asarray(node, dtype=int)}) for node in nodes)
     graph.add_edges_from(zip(nodes, nodes[1:]))
     return graph
+
+
+def test_all_paths_enumerates_eligible_pairs_once() -> None:
+    graph = _line_graph(4)
+    graph.add_edge((20, 0), (21, 0))
+    graph.add_node((30, 0))
+    paths = _all_gt_paths(graph, min_path_length=3)
+    assert {(path["s_gt"], path["t_gt"]) for path in paths} == {
+        ((0, 0), (2, 0)), ((0, 0), (3, 0)), ((1, 0), (3, 0)),
+    }
+    assert len(paths) == 3
+
+
+def test_all_paths_keeps_infeasible_routes_in_denominator(tmp_path: Path) -> None:
+    config = {**TLTS_CONFIG, "num_paths": "all", "max_attempts": None, "random_seed": None}
+    metric = TLTS(_write_config(tmp_path, config, data_dim=2))
+    target = _line_graph(4)
+    prediction = target.copy()
+    prediction.remove_edge((1, 0), (2, 0))
+    result = metric.score(target, prediction)
+    assert result["tlts_correct"] == pytest.approx(2 / 6)
+    assert result["tlts_infeasible"] == pytest.approx(4 / 6)
+    assert result["tlts_toolong"] == result["tlts_tooshort"] == 0.0
+    config["max_attempts"] = 500
+    with pytest.raises(ValueError, match="requires max_attempts=null"):
+        TLTS(_write_config(tmp_path, config, data_dim=2))
 
 
 def _three_d_target_graph() -> nx.Graph:

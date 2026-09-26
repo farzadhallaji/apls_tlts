@@ -11,7 +11,7 @@ from __future__ import annotations
 import copy
 import random
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import networkx as nx
@@ -36,14 +36,25 @@ class EuclideanSegment:
 
     start: tuple[float, ...]
     end: tuple[float, ...]
+    _start_array: np.ndarray = field(init=False, repr=False, compare=False)
+    _direction: np.ndarray = field(init=False, repr=False, compare=False)
+    _squared_length: float = field(init=False, repr=False, compare=False)
+    _length: float = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         start_array = _point_array(self.start)
         end_array = _point_array(self.end)
         if start_array.shape != end_array.shape:
             raise ValueError("APLS segment endpoints must have the same dimension")
+        start_array.setflags(write=False)
+        direction = np.subtract(end_array, start_array)
+        direction.setflags(write=False)
         object.__setattr__(self, "start", tuple(float(value) for value in start_array))
         object.__setattr__(self, "end", tuple(float(value) for value in end_array))
+        object.__setattr__(self, "_start_array", start_array)
+        object.__setattr__(self, "_direction", direction)
+        object.__setattr__(self, "_squared_length", float(np.dot(direction, direction)))
+        object.__setattr__(self, "_length", float(np.linalg.norm(direction)))
 
     @property
     def dimension(self) -> int:
@@ -51,30 +62,33 @@ class EuclideanSegment:
 
     @property
     def length(self) -> float:
-        return float(np.linalg.norm(np.subtract(self.end, self.start)))
+        return self._length
 
     def project(self, point: Iterable[float]) -> float:
         """Return the clamped distance along the segment nearest ``point``."""
 
         point_array = _point_array(point)
-        start_array = np.asarray(self.start)
-        direction = np.subtract(self.end, self.start)
-        squared_length = float(np.dot(direction, direction))
-        if squared_length == 0.0:
+        if self._squared_length == 0.0:
             return 0.0
-        fraction = float(np.dot(np.subtract(point_array, start_array), direction))
-        fraction /= squared_length
+        fraction = float(
+            np.dot(np.subtract(point_array, self._start_array), self._direction)
+        )
+        fraction /= self._squared_length
         fraction = min(1.0, max(0.0, fraction))
-        return fraction * self.length
+        return fraction * self._length
 
     def interpolate(self, distance: float) -> tuple[float, ...]:
         """Return the point at a clamped distance along the segment."""
 
-        segment_length = self.length
+        segment_length = self._length
         if segment_length == 0.0:
             return self.start
+        if distance <= 0.0:
+            return self.start
+        if distance >= segment_length:
+            return self.end
         fraction = min(1.0, max(0.0, float(distance) / segment_length))
-        point = np.asarray(self.start) + fraction * np.subtract(self.end, self.start)
+        point = self._start_array + fraction * self._direction
         return tuple(float(value) for value in point)
 
     def distance(self, point: Iterable[float]) -> float:
@@ -195,6 +209,83 @@ def insert_point_into_G(
 ) -> tuple[nx.MultiGraph, dict[str, Any], tuple[float, ...], tuple[float, ...]]:
     """Insert a control point by snapping or splitting its closest edge."""
 
+    return _insert_point_into_G(
+        graph,
+        point,
+        node_id,
+        max_distance_meters,
+        dist_close_node,
+        nearby_nodes,
+        allow_renaming,
+        weight,
+        verbose,
+        super_verbose,
+        zero_length_tolerance,
+        rename_owned_graph_in_place=False,
+    )
+
+
+def _relabel_node_in_place_preserving_order(
+    graph: nx.MultiGraph,
+    old_node: Any,
+    new_node: Any,
+) -> nx.MultiGraph:
+    """Rename one absent target on a privately owned graph, keeping iteration order.
+
+    NetworkX's copy-based relabel is the public insertion behavior. The bulk
+    insertion path already owns a graph copy, so rebuilding that graph for
+    every renamed endpoint is unnecessary. Re-keying its ordered internal
+    dictionaries in place gives the same node and edge iteration order as the
+    copy-based operation while preserving node and edge attributes.
+    """
+
+    if not isinstance(graph, nx.MultiGraph) or graph.is_directed():
+        raise TypeError("ordered in-place relabeling requires an undirected MultiGraph")
+    if old_node not in graph:
+        raise ValueError(f"node to relabel is absent: {old_node!r}")
+    if new_node in graph:
+        raise ValueError(f"new node ID already exists: {new_node!r}")
+
+    node_entries = [
+        (new_node if node == old_node else node, properties)
+        for node, properties in graph._node.items()
+    ]
+    adjacency_entries = [
+        (new_node if node == old_node else node, adjacent)
+        for node, adjacent in graph._adj.items()
+    ]
+    for adjacent in graph._adj.values():
+        if old_node in adjacent:
+            renamed_neighbors = [
+                (new_node if neighbor == old_node else neighbor, edge_keys)
+                for neighbor, edge_keys in adjacent.items()
+            ]
+            adjacent.clear()
+            adjacent.update(renamed_neighbors)
+
+    graph._node.clear()
+    graph._node.update(node_entries)
+    graph._adj.clear()
+    graph._adj.update(adjacency_entries)
+    return graph
+
+
+def _insert_point_into_G(
+    graph: nx.MultiGraph,
+    point: tuple[float, ...],
+    node_id: Any,
+    max_distance_meters: float,
+    dist_close_node: float,
+    nearby_nodes: set[Any],
+    allow_renaming: bool,
+    weight: str,
+    verbose: bool,
+    super_verbose: bool,
+    zero_length_tolerance: float,
+    rename_owned_graph_in_place: bool,
+) -> tuple[nx.MultiGraph, dict[str, Any], tuple[float, ...], tuple[float, ...]]:
+    """Insert one point with an explicit ownership policy for endpoint renames."""
+
     best_edge, minimum_distance, best_geometry = get_closest_edge_from_G(
         graph,
         point,
@@ -208,6 +299,14 @@ def insert_point_into_G(
     if node_id in graph:
         return graph, {}, tuple(), tuple()
 
+    # Undirected edge iteration need not preserve stored geometry orientation.
+    start = tuple(graph.nodes[u]["coord"])
+    end = tuple(graph.nodes[v]["coord"])
+    if best_geometry.start == end and best_geometry.end == start:
+        best_geometry = EuclideanSegment(start, end)
+    elif best_geometry.start != start or best_geometry.end != end:
+        raise ValueError("APLS edge geometry endpoints do not match its graph nodes")
+
     projected_distance = best_geometry.project(point)
     projected_point = best_geometry.interpolate(projected_distance)
     endpoint: Any = None
@@ -217,7 +316,7 @@ def insert_point_into_G(
         candidate_distance = float(
             np.linalg.norm(np.subtract(projected_point, candidate_position))
         )
-        endpoint_is_exact = candidate_distance == 0.0
+        endpoint_is_exact = candidate_distance <= zero_length_tolerance
         endpoint_is_close = candidate_distance < dist_close_node
         if (endpoint_is_exact or endpoint_is_close) and (
             endpoint_distance is None or candidate_distance < endpoint_distance
@@ -225,15 +324,33 @@ def insert_point_into_G(
             endpoint = candidate
             endpoint_distance = candidate_distance
 
+    # A projection within the split tolerance of either endpoint cannot form
+    # two non-degenerate segments. Use that endpoint exactly, including at the
+    # far end where distance along the edge is large.
+    endpoint_is_degenerate = (
+        endpoint_distance is not None
+        and endpoint_distance <= zero_length_tolerance
+    )
+    if endpoint_is_degenerate:
+        projected_point = tuple(graph.nodes[endpoint]["coord"])
+
     node_properties: dict[str, Any] = {
         "coord": projected_point,
         "pos": np.asarray(projected_point, dtype=float),
     }
 
-    if endpoint is not None and projected_distance <= dist_close_node:
+    if endpoint is not None and (
+        endpoint_is_degenerate or projected_distance <= dist_close_node
+    ):
         if allow_renaming:
-            renamed = nx.relabel_nodes(graph, {endpoint: node_id}, copy=True)
-            return renamed, dict(graph.nodes[endpoint]), projected_point, projected_point
+            endpoint_properties = dict(graph.nodes[endpoint])
+            if rename_owned_graph_in_place:
+                renamed = _relabel_node_in_place_preserving_order(
+                    graph, endpoint, node_id
+                )
+            else:
+                renamed = nx.relabel_nodes(graph, {endpoint: node_id}, copy=True)
+            return renamed, endpoint_properties, projected_point, projected_point
         graph.add_node(node_id, **node_properties)
         edge_data = copy.deepcopy(_edge_data(graph, u, v, key))
         edge_data[weight] = 0.0
@@ -300,7 +417,7 @@ def insert_control_points(
     skipped_positions: list[tuple[float, ...]] = []
     for control_point in control_points:
         node_id, point = control_point
-        output, _, inserted, skipped = insert_point_into_G(
+        output, _, inserted, skipped = _insert_point_into_G(
             output,
             tuple(point),
             node_id=node_id,
@@ -312,6 +429,7 @@ def insert_control_points(
             verbose=verbose,
             super_verbose=super_verbose,
             zero_length_tolerance=zero_length_tolerance,
+            rename_owned_graph_in_place=True,
         )
         if len(inserted) > 0:
             inserted_positions.append(inserted)
@@ -430,12 +548,12 @@ def make_graphs_yuge(
         "zero_length_tolerance": 1e-12,
     }
     proposal_with_ground_truth, _, _ = insert_control_points(
-        proposal_native.copy(),
+        proposal_native,
         control_points_ground_truth,
         **insertion_parameters,
     )
     ground_truth_with_proposal, _, _ = insert_control_points(
-        ground_truth_native.copy(),
+        ground_truth_native,
         control_points_proposal,
         **insertion_parameters,
     )

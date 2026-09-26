@@ -5,6 +5,16 @@ metric code required at runtime lives in this directory.
 
 ## Public API
 
+TLTS supports `parameters.num_paths: all` for exhaustive endpoint-pair scoring.
+Set `max_attempts: null` and `random_seed: null` in that mode. Every unordered
+pair of distinct vertices within a connected ground-truth component contributes
+one unweighted shortest path when it meets `min_path_length` (vertex count).
+Alternative paths for the same pair are not enumerated. Correct, too-short,
+too-long, and infeasible fractions share the full eligible-pair denominator.
+When no pair is eligible, the public score returns zero for the first three
+fractions and one for infeasible. Integer `num_paths` retains seeded sampling.
+Exhaustive evaluation can examine n*(n-1)/2 pairs in a connected n-node graph.
+
 Both metrics load every result-affecting parameter from a YAML file when they
 are constructed. A score call accepts two prebuilt undirected NetworkX graphs
 and no mask, tensor, threshold, or channel arguments:

@@ -262,3 +262,277 @@ def test_apls_3d_config_file_is_usable() -> None:
 
     assert metric.config.data_dim == 3
     assert metric.score(graph, graph.copy()) == pytest.approx(1.0)
+
+
+def _snapshot_value(value: object) -> object:
+    if isinstance(value, np.ndarray):
+        return (
+            "array",
+            str(value.dtype),
+            tuple(value.shape),
+            _snapshot_value(value.tolist()),
+        )
+    if isinstance(value, dict):
+        return tuple((key, _snapshot_value(item)) for key, item in value.items())
+    if isinstance(value, (tuple, list)):
+        return tuple(_snapshot_value(item) for item in value)
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _graph_snapshot(graph: nx.MultiGraph) -> tuple[object, ...]:
+    return (
+        tuple(
+            (node, _snapshot_value(dict(data))) for node, data in graph.nodes(data=True)
+        ),
+        tuple(
+            (u, v, key, _snapshot_value(dict(data)))
+            for u, v, key, data in graph.edges(keys=True, data=True)
+        ),
+        _snapshot_value(dict(graph.graph)),
+    )
+
+
+def test_owned_relabel_matches_copy_iteration_order_and_preserves_source() -> None:
+    graph = nx.MultiGraph()
+    graph.graph["metadata"] = {"frame": "retained"}
+    graph.add_node("before", coord=(0.0, 0.0), pos=(0.0, 0.0))
+    graph.add_node("rename", coord=(1.0, 0.0), pos=(1.0, 0.0))
+    graph.add_node("after", coord=(2.0, 0.0), pos=(2.0, 0.0))
+    graph.add_node("tail", coord=(3.0, 0.0), pos=(3.0, 0.0))
+    graph.add_edge(
+        "after",
+        "tail",
+        key="later-insertion",
+        length=1.0,
+        geometry=apls_core.EuclideanSegment((2.0, 0.0), (3.0, 0.0)),
+    )
+    graph.add_edge(
+        "before",
+        "rename",
+        key="earlier-iteration",
+        length=1.0,
+        geometry=apls_core.EuclideanSegment((0.0, 0.0), (1.0, 0.0)),
+    )
+    graph.add_edge(
+        "rename",
+        "after",
+        key="parallel-a",
+        length=1.0,
+        geometry=apls_core.EuclideanSegment((1.0, 0.0), (2.0, 0.0)),
+    )
+    graph.add_edge(
+        "rename",
+        "after",
+        key="parallel-b",
+        length=1.0,
+        geometry=apls_core.EuclideanSegment((1.0, 0.0), (2.0, 0.0)),
+    )
+    graph.add_edge(
+        "rename",
+        "rename",
+        key="self-loop",
+        length=0.0,
+        geometry=apls_core.EuclideanSegment((1.0, 0.0), (1.0, 0.0)),
+    )
+    source_before = _graph_snapshot(graph)
+    expected = nx.relabel_nodes(graph.copy(), {"rename": "selected"}, copy=True)
+    actual = apls_core._relabel_node_in_place_preserving_order(
+        graph.copy(), "rename", "selected"
+    )
+
+    assert _graph_snapshot(actual) == _graph_snapshot(expected)
+    assert _graph_snapshot(graph) == source_before
+    assert all(actual._adj[u][v] is actual._adj[v][u] for u, v in actual.edges())
+
+
+def test_bulk_insertion_preserves_tie_order_and_public_inputs() -> None:
+    graph = nx.MultiGraph()
+    graph.graph["frame"] = "full-image"
+    coordinates = {
+        "a": (0.0, 0.0),
+        "b": (10.0, 0.0),
+        "c": (0.0, 2.0),
+        "d": (10.0, 2.0),
+    }
+    for node, position in coordinates.items():
+        graph.add_node(node, coord=position, pos=position)
+    graph.add_edge(
+        "c",
+        "d",
+        key=0,
+        length=10.0,
+        geometry=apls_core.EuclideanSegment(coordinates["c"], coordinates["d"]),
+    )
+    graph.add_edge(
+        "a",
+        "b",
+        key=0,
+        length=10.0,
+        geometry=apls_core.EuclideanSegment(coordinates["a"], coordinates["b"]),
+    )
+    source_before = _graph_snapshot(graph)
+    tied_edge, tied_distance, _ = apls_core.get_closest_edge_from_G(
+        graph, (0.0, 1.0), nearby_nodes=set(), verbose=False
+    )
+    assert tied_edge == ["a", "b", 0]
+    assert tied_distance == 1.0
+
+    controls = [["selected_a", (0.0, 1.0)], ["selected_b", (10.0, 1.0)]]
+    expected = graph.copy()
+    for node_id, point in controls:
+        expected, _, _, _ = apls_core.insert_point_into_G(
+            expected,
+            point,
+            node_id=node_id,
+            max_distance_meters=2.0,
+            dist_close_node=0.1,
+            nearby_nodes=set(),
+            allow_renaming=True,
+            weight="length",
+            verbose=False,
+            super_verbose=False,
+            zero_length_tolerance=1.0e-12,
+        )
+    actual, inserted, skipped = apls_core.insert_control_points(
+        graph,
+        controls,
+        max_distance_meters=2.0,
+        dist_close_node=0.1,
+        allow_renaming=True,
+        weight="length",
+        verbose=False,
+        super_verbose=False,
+        zero_length_tolerance=1.0e-12,
+    )
+
+    assert _graph_snapshot(actual) == _graph_snapshot(expected)
+    assert _graph_snapshot(graph) == source_before
+    assert inserted == [(0.0, 0.0), (10.0, 0.0)]
+    assert skipped == [(0.0, 0.0), (10.0, 0.0)]
+
+    public_result, _, _, _ = apls_core.insert_point_into_G(
+        graph,
+        (0.0, 1.0),
+        node_id="public_selected",
+        max_distance_meters=2.0,
+        dist_close_node=0.1,
+        nearby_nodes=set(),
+        allow_renaming=True,
+        weight="length",
+        verbose=False,
+        super_verbose=False,
+        zero_length_tolerance=1.0e-12,
+    )
+    assert "a" in graph
+    assert "public_selected" not in graph
+    assert "a" not in public_result
+    assert _graph_snapshot(graph) == source_before
+
+
+def test_cached_segment_geometry_matches_uncached_2d_and_3d_formulas() -> None:
+    cases = [
+        ((1.0, -2.0), (8.0, 3.0), (4.0, 6.0), 2.75),
+        ((1.0, -2.0, 4.0), (8.0, 3.0, -1.0), (4.0, 6.0, 3.0), 2.75),
+        ((2.0, 1.0), (2.0, 1.0), (5.0, 4.0), 0.0),
+    ]
+    for start, end, point, interpolation_distance in cases:
+        segment = apls_core.EuclideanSegment(start, end)
+        start_array = np.asarray(segment.start)
+        direction = np.subtract(segment.end, segment.start)
+        expected_length = float(np.linalg.norm(direction))
+        point_array = np.asarray(tuple(point), dtype=float)
+        squared_length = float(np.dot(direction, direction))
+        if squared_length == 0.0:
+            projected_distance = 0.0
+        else:
+            fraction = float(np.dot(np.subtract(point_array, start_array), direction))
+            fraction /= squared_length
+            fraction = min(1.0, max(0.0, fraction))
+            projected_distance = fraction * expected_length
+        interpolation_fraction = (
+            0.0
+            if expected_length == 0.0
+            else min(1.0, max(0.0, interpolation_distance / expected_length))
+        )
+        expected_interpolated = tuple(
+            float(value) for value in start_array + interpolation_fraction * direction
+        )
+        projected_fraction = (
+            0.0
+            if expected_length == 0.0
+            else min(1.0, max(0.0, projected_distance / expected_length))
+        )
+        expected_projection = tuple(
+            float(value) for value in start_array + projected_fraction * direction
+        )
+        expected_distance = float(
+            np.linalg.norm(np.subtract(tuple(point), expected_projection))
+        )
+
+        assert segment.length == expected_length
+        assert segment.project(point) == projected_distance
+        assert segment.interpolate(interpolation_distance) == expected_interpolated
+        assert segment.distance(point) == expected_distance
+        assert not segment._start_array.flags.writeable
+        assert not segment._direction.flags.writeable
+
+
+@pytest.mark.parametrize("near_end", [False, True])
+@pytest.mark.parametrize("allow_renaming", [False, True])
+@pytest.mark.parametrize("dist_close_node", [0.0, 10.0])
+def test_control_point_within_split_tolerance_uses_exact_endpoint(
+    near_end: bool, allow_renaming: bool, dist_close_node: float,
+) -> None:
+    graph = nx.MultiGraph()
+    graph.add_node("left", coord=(0.0, 0.0))
+    graph.add_node("right", coord=(100.0, 0.0))
+    graph.add_edge(
+        "left", "right", length=100.0,
+        geometry=apls_core.EuclideanSegment((0.0, 0.0), (100.0, 0.0)),
+    )
+    x = 100.0 - 5e-13 if near_end else 5e-13
+    endpoint = "right" if near_end else "left"
+    expected_point = graph.nodes[endpoint]["coord"]
+    result, _, inserted, _ = apls_core.insert_point_into_G(
+        graph, (x, 0.0), node_id="control",
+        max_distance_meters=1.0, dist_close_node=dist_close_node,
+        nearby_nodes=set(), allow_renaming=allow_renaming, weight="length",
+        verbose=False, super_verbose=False, zero_length_tolerance=1e-12,
+    )
+    assert inserted == expected_point
+    assert result.nodes["control"]["coord"] == expected_point
+    opposite = "left" if near_end else "right"
+    assert nx.shortest_path_length(result, "control", opposite, weight="length") == 100.0
+    if allow_renaming:
+        assert endpoint not in result
+        assert result.number_of_edges() == 1
+    else:
+        assert result["control"][endpoint][0]["length"] == 0.0
+        assert result["control"][endpoint][0]["geometry"].length == 0.0
+        assert result.number_of_edges() == 2
+
+
+def test_repeated_control_insertion_preserves_reversed_undirected_geometry() -> None:
+    graph = nx.MultiGraph()
+    graph.add_node("right", coord=(100.0, 0.0))
+    graph.add_node("left", coord=(0.0, 0.0))
+    graph.add_edge(
+        "left", "right", length=100.0,
+        geometry=apls_core.EuclideanSegment((0.0, 0.0), (100.0, 0.0)),
+    )
+    for index, x in enumerate((25.0, 75.0, 50.0, 100.0)):
+        graph, _, _, _ = apls_core.insert_point_into_G(
+            graph, (x, 0.0), node_id=f"control_{index}",
+            max_distance_meters=1.0, dist_close_node=0.0,
+            nearby_nodes=set(), allow_renaming=False, weight="length",
+            verbose=False, super_verbose=False, zero_length_tolerance=0.0,
+        )
+        for u, v, data in graph.edges(data=True):
+            geometry = data["geometry"]
+            assert {geometry.start, geometry.end} == {
+                graph.nodes[u]["coord"], graph.nodes[v]["coord"]
+            }
+        assert nx.shortest_path_length(graph, "left", "right", weight="length") == 100.0
+        assert graph.nodes[f"control_{index}"]["coord"] == (x, 0.0)
